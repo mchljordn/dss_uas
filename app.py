@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Optional
 import warnings
 warnings.filterwarnings('ignore')
-import os
 import pickle
 import joblib
 
@@ -72,7 +71,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Session state initialization
 if 'data_loaded' not in st.session_state:
     st.session_state.data_loaded = False
 if 'forecasts_generated' not in st.session_state:
@@ -96,10 +94,9 @@ def _models_file_signature(models_dir: Path) -> Optional[tuple]:
         return None
 
 
-# Load trained models from pickle files; cache invalidates when files change
 @st.cache_resource(show_spinner=False)
 def load_trained_models(file_signature: Optional[tuple]):
-    """Load pre-trained models from notebook; uses signature to refresh on retrain."""
+    """Load pre-trained models from notebook; cache invalidates when retrained."""
     try:
         models_dir = Path(__file__).resolve().parent / 'models'
 
@@ -127,12 +124,11 @@ def load_trained_models(file_signature: Optional[tuple]):
         return None, None, None, None, False
 
 
-# Load models on app start (reloads automatically when files are retrained)
+# Load models on app start
 models_dir = Path(__file__).resolve().parent / 'models'
 file_signature = _models_file_signature(models_dir)
 arima_model, es_model, ma_stats, model_metadata, models_loaded = load_trained_models(file_signature)
 
-# Helper Functions
 @st.cache_data
 def load_data(file):
     """Load and preprocess sales data (mirrors mining.ipynb cleaning steps)."""
@@ -141,37 +137,30 @@ def load_data(file):
     initial_rows = len(df)
     cleaning_log = {}
 
-    # 1) Flag + remove cancelled transactions (TransactionNo starts with 'C')
     df['IsCancelled'] = df['TransactionNo'].astype(str).str.startswith('C')
     cancelled_count = int(df['IsCancelled'].sum())
     df = df[~df['IsCancelled']].copy()
     df = df.drop('IsCancelled', axis=1)
     cleaning_log['Cancelled transactions removed'] = cancelled_count
 
-    # 2) Remove negative quantities or prices (Notebook: only negative, not zero)
     negative_qty = int((df['Quantity'] < 0).sum())
     negative_price = int((df['Price'] < 0).sum())
     if negative_qty > 0 or negative_price > 0:
         df = df[(df['Quantity'] > 0) & (df['Price'] > 0)].copy()
     cleaning_log['Negative qty/price removed'] = negative_qty + negative_price
 
-    # 3) Drop missing values in key columns (Notebook key_columns)
     key_columns = ['Date', 'ProductNo', 'Price', 'Quantity']
     missing_before = int(df[key_columns].isnull().sum().sum())
     if missing_before > 0:
         df = df.dropna(subset=key_columns)
     cleaning_log['Rows with missing key fields removed'] = missing_before
 
-    # 4) Convert Date (Notebook: format='%m/%d/%Y' then fallback)
     try:
         df['Date'] = pd.to_datetime(df['Date'], format='%m/%d/%Y')
     except Exception:
         df['Date'] = pd.to_datetime(df['Date'])
 
-    # 5) Compute Revenue (Notebook: Price * Quantity)
     df['Revenue'] = df['Price'] * df['Quantity']
-
-    # 6) Sort by date (Notebook: before time-series aggregation)
     df = df.sort_values('Date').reset_index(drop=True)
 
     final_rows = len(df)
@@ -191,32 +180,26 @@ def prepare_time_series(df):
         'Quantity': 'sum',
         'Revenue': 'sum'
     }).reset_index()
-    
     daily_sales.columns = ['Date', 'NumTransactions', 'TotalQuantity', 'TotalRevenue']
     daily_sales = daily_sales.sort_values('Date').reset_index(drop=True)
     
-    # Set date as index and fill missing dates
     ts_data = daily_sales.set_index('Date')
     ts_data = ts_data.asfreq('D', method='ffill')
-    
     return ts_data
 
 @st.cache_data
 def calculate_product_stats(df):
-    """Calculate product-level statistics"""
+    """Calculate product-level statistics and ABC classification"""
     product_sales = df.groupby(['ProductNo', 'ProductName']).agg({
         'TransactionNo': 'count',
         'Quantity': 'sum',
         'Revenue': 'sum',
         'Price': 'mean'
     }).reset_index()
-    
     product_sales.columns = ['ProductNo', 'ProductName', 'NumTransactions', 
                             'TotalQuantity', 'TotalRevenue', 'AvgPrice']
-    
     product_sales = product_sales.sort_values('TotalRevenue', ascending=False).reset_index(drop=True)
     
-    # ABC Classification
     product_sales['RevenuePct'] = (product_sales['TotalRevenue'] / 
                                    product_sales['TotalRevenue'].sum() * 100)
     product_sales['CumulativePct'] = product_sales['RevenuePct'].cumsum()
@@ -226,24 +209,16 @@ def calculate_product_stats(df):
             return 'A - Best Sellers (Top 80%)'
         elif cum_pct <= 95:
             return 'B - Moderate Sellers'
-        else:
-            return 'C - Slow Movers'
+        return 'C - Slow Movers'
     
     product_sales['Category'] = product_sales['CumulativePct'].apply(classify_abc)
-    
     return product_sales
 
 def train_arima_model(train_data):
-    """Train ARIMA model with dynamic order selection (matches notebook logic)"""
-    # Test different ARIMA configurations (same as notebook)
+    """Train ARIMA model with dynamic order selection"""
     arima_configs = [
-        (1, 1, 1),
-        (2, 1, 2),
-        (1, 1, 2),
-        (2, 1, 1),
-        (3, 1, 2),
-        (1, 0, 1),
-        (2, 0, 2)
+        (1, 1, 1), (2, 1, 2), (1, 1, 2), (2, 1, 1),
+        (3, 1, 2), (1, 0, 1), (2, 0, 2)
     ]
     
     best_aic = np.inf
@@ -252,16 +227,13 @@ def train_arima_model(train_data):
     
     for order in arima_configs:
         try:
-            model = ARIMA(train_data, order=order)
-            model_fit = model.fit()
-            
-            if model_fit.aic < best_aic:
-                best_aic = model_fit.aic
-                best_model = model_fit
+            model = ARIMA(train_data, order=order).fit()
+            if model.aic < best_aic:
+                best_aic = model.aic
+                best_model = model
                 best_order = order
         except:
             continue
-    
     return best_model, best_order
 
 def train_exponential_smoothing(train_data):
@@ -282,9 +254,7 @@ def train_exponential_smoothing(train_data):
 
 def train_moving_average(train_data, window_size=7):
     """Train Moving Average model"""
-    # Calculate moving average on training data
     ma_values = train_data.rolling(window=window_size).mean()
-    # Return last MA value for forecasting
     return ma_values.iloc[-window_size:].mean() if len(ma_values) >= window_size else train_data.mean()
 
 # ============================================================================
@@ -304,25 +274,17 @@ Sistem ini membantu manajer dalam:
 - **Strategi Promosi**: Rekomendasi hari dan kategori fokus
 """)
 
-# Sidebar
 with st.sidebar:
     st.header("⚙️ Pengaturan")
-    
-    # File upload
     uploaded_file = st.file_uploader("Upload Data Penjualan (CSV)", type=['csv'])
-    
     if uploaded_file is not None:
         st.session_state.data_loaded = True
     
     st.markdown("---")
-    
-    # Forecasting parameters
     st.subheader("📊 Parameter Forecasting")
-    forecast_days = st.slider("Periode Prediksi (hari)", 7, 365, 30)
+    forecast_days = st.slider("Periode Prediksi (hari)", 7, 90, 30)
     
     st.markdown("---")
-    
-    # Model selection
     st.subheader("🤖 Pilih Model")
     model_choice = st.selectbox("Model Forecasting", 
                                 ['Moving Average', 'ARIMA', 'Exponential Smoothing', 'Auto (Best Model)'])
@@ -366,12 +328,9 @@ else:
     with tab1:
         st.header("📈 Overview Bisnis")
         
-        # 🆕 DATA QUALITY REPORT (Expandable)
         with st.expander("📋 Data Quality Report", expanded=True):
             if hasattr(st.session_state, 'cleaning_log') and st.session_state.cleaning_log:
                 log = st.session_state.cleaning_log
-                
-                # Summary metrics
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
                     st.metric("Final Clean Rows", f"{log.get('Final clean rows', 0):,}")
@@ -383,16 +342,12 @@ else:
                     st.metric("Date Range", f"{df['Date'].min().date()} - {df['Date'].max().date()}")
                 
                 st.markdown("**Cleaning Details:**")
-                
-                # Show cleaning breakdown
                 cleaning_details = {k: v for k, v in log.items() 
                         if k not in ['Final clean rows', 'Data retention rate (%)', 'Total rows removed']}
-                
                 for action, count in cleaning_details.items():
                     if count > 0:
                         st.warning(f"🗑️ {action}: {count:,}")
                 
-                # Data validation checks
                 st.markdown("**Data Validation:**")
                 col1, col2 = st.columns(2)
                 
@@ -410,7 +365,6 @@ else:
                     else:
                         st.error(f"❌ {dupes} duplicates found")
                 
-                # Revenue statistics
                 st.markdown("**Revenue Statistics:**")
                 col1, col2, col3 = st.columns(3)
                 with col1:
@@ -421,10 +375,7 @@ else:
                     st.metric("Max Revenue", f"£{df['Revenue'].max():,.2f}")
         
         st.markdown("---")
-        
-        # Key metrics
         col1, col2, col3, col4 = st.columns(4)
-        
         total_revenue = df['Revenue'].sum()
         total_transactions = df['TransactionNo'].nunique()
         total_products = df['ProductNo'].nunique()
@@ -440,8 +391,6 @@ else:
             st.metric("Avg Daily Revenue", f"£{avg_daily_revenue:,.0f}")
         
         st.markdown("---")
-        
-        # Revenue trend
         col1, col2 = st.columns([2, 1])
         
         with col1:
@@ -474,10 +423,8 @@ else:
                 use_container_width=True
             )
         
-        # ABC Analysis
         st.markdown("---")
         st.subheader("📊 ABC Classification")
-        
         abc_summary = product_stats.groupby('Category').agg({
             'ProductNo': 'count',
             'TotalRevenue': 'sum'
@@ -485,7 +432,6 @@ else:
         abc_summary.columns = ['Category', 'Jumlah Produk', 'Total Revenue']
         abc_summary['Revenue %'] = (abc_summary['Total Revenue'] / 
                                     abc_summary['Total Revenue'].sum() * 100).round(1)
-        
         col1, col2 = st.columns(2)
         
         with col1:
@@ -511,13 +457,9 @@ else:
             fig.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
             st.plotly_chart(fig, use_container_width=True)
     
-    # ========================================================================
-    # TAB 2: FORECASTING & STOCK
-    # ========================================================================
     with tab2:
         st.header("🔮 Forecasting Revenue")
         
-        # Show status of trained models
         if models_loaded:
             st.success("✅ **Trained models loaded from notebook** (mining.ipynb)")
             with st.expander("📊 Model Information"):
@@ -533,50 +475,34 @@ else:
         
         if st.button("🚀 Generate Forecast", type="primary"):
             with st.spinner("Memproses forecasting..."):
-                
                 if not models_loaded:
                     st.error("❌ Trained models not found! Please run the notebook (mining.ipynb) first to train and save models.")
                 else:
-                    # Train-test split
                     train_size = int(len(ts_data) * 0.8)
                     train_data = ts_data['TotalRevenue'][:train_size]
                     test_data = ts_data['TotalRevenue'][train_size:]
                     
-                    # Use notebook's chosen order for ARIMA; fallback if missing
-                    best_arima_order = model_metadata.get('best_order') if model_metadata else None
-                    if best_arima_order is None:
-                        best_arima_order = (2, 1, 2)
-
-                    # Refit models on the uploaded data (avoid stale, flat forecasts)
-                    # Moving Average baseline
+                    best_arima_order = model_metadata.get('best_order') if model_metadata else (2, 1, 2)
                     ma_avg = ma_stats['ma_value'] if ma_stats else train_data.mean()
 
-                    # ARIMA refit
                     arima_fit = ARIMA(train_data, order=best_arima_order).fit()
                     arima_test_pred = arima_fit.forecast(steps=len(test_data))
 
-                    # Exponential Smoothing refit
                     try:
                         es_fit = ExponentialSmoothing(
-                            train_data,
-                            seasonal_periods=7,
-                            trend='add',
-                            seasonal='add',
+                            train_data, seasonal_periods=7, trend='add', seasonal='add',
                             initialization_method='estimated'
                         ).fit(optimized=True)
-                    except Exception:
+                    except:
                         es_fit = ExponentialSmoothing(train_data, trend='add', seasonal=None).fit(optimized=True)
                     es_test_pred = es_fit.forecast(steps=len(test_data))
 
-                    # Test predictions
                     ma_test_pred = pd.Series([ma_avg] * len(test_data), index=test_data.index)
 
-                    # Calculate errors
                     mae_ma = mean_absolute_error(test_data, ma_test_pred)
                     mae_arima = mean_absolute_error(test_data, arima_test_pred)
                     mae_es = mean_absolute_error(test_data, es_test_pred)
 
-                    # Select best model
                     if model_choice == 'Moving Average':
                         best_model_name = 'Moving Average'
                     elif model_choice == 'ARIMA':
@@ -587,7 +513,6 @@ else:
                         errors = {'Moving Average': mae_ma, 'ARIMA': mae_arima, 'Exponential Smoothing': mae_es}
                         best_model_name = min(errors, key=errors.get)
 
-                    # Retrain best model on full data
                     full_data = ts_data['TotalRevenue']
                     if best_model_name == 'Moving Average':
                         ma_avg_full = full_data.mean()
@@ -598,20 +523,15 @@ else:
                     else:
                         try:
                             future_model = ExponentialSmoothing(
-                                full_data,
-                                seasonal_periods=7,
-                                trend='add',
-                                seasonal='add',
+                                full_data, seasonal_periods=7, trend='add', seasonal='add',
                                 initialization_method='estimated'
                             ).fit(optimized=True)
-                        except Exception:
+                        except:
                             future_model = ExponentialSmoothing(full_data, trend='add', seasonal=None).fit(optimized=True)
 
-                    # Future forecast
                     future_dates = pd.date_range(
                         start=ts_data.index[-1] + timedelta(days=1),
-                        periods=forecast_days,
-                        freq='D'
+                        periods=forecast_days, freq='D'
                     )
 
                     if best_model_name == 'Moving Average':
@@ -619,11 +539,10 @@ else:
                     elif best_model_name == 'ARIMA':
                         future_forecast = future_model.forecast(steps=forecast_days)
                         future_forecast.index = future_dates
-                    else:  # Exponential Smoothing
+                    else:
                         future_forecast = future_model.forecast(steps=forecast_days)
                         future_forecast.index = future_dates
 
-                    # Store in session state
                     st.session_state.future_forecast = future_forecast
                     st.session_state.best_model_name = best_model_name
                     st.session_state.mae_ma = mae_ma
@@ -636,8 +555,6 @@ else:
         if st.session_state.forecasts_generated:
             future_forecast = st.session_state.future_forecast
             best_model_name = st.session_state.best_model_name
-            
-            # Model performance
             st.subheader("🎯 Model Performance")
             col1, col2, col3, col4 = st.columns(4)
             
@@ -650,25 +567,19 @@ else:
             with col4:
                 st.metric("Exp. Smoothing MAE", f"£{st.session_state.mae_es:,.0f}")
             
-            # Show ARIMA order info if ARIMA is selected
             if best_model_name == 'ARIMA' and hasattr(st.session_state, 'final_arima_order'):
-                st.info(f"📊 **ARIMA Order Optimal:** {st.session_state.final_arima_order} (dipilih dari 7 konfigurasi berdasarkan AIC terendah)")
+                st.info(f"📊 **ARIMA Order Optimal:** {st.session_state.final_arima_order} (selected by lowest AIC)")
             
-            # Forecast visualization
             st.subheader("📈 Prediksi Revenue")
             
             fig = go.Figure()
-            
-            # Historical data
             fig.add_trace(go.Scatter(
-                x=ts_data.index[-90:],  # Last 90 days
+                x=ts_data.index[-90:],
                 y=ts_data['TotalRevenue'][-90:],
                 mode='lines',
                 name='Data Historis',
                 line=dict(color='#1f77b4', width=2)
             ))
-            
-            # Future forecast
             fig.add_trace(go.Scatter(
                 x=future_forecast.index,
                 y=future_forecast,
@@ -678,25 +589,18 @@ else:
                 marker=dict(size=6)
             ))
             
-            # Confidence interval (simplified)
             std_error = ts_data['TotalRevenue'].std() * 0.1
             upper_bound = future_forecast + 1.96 * std_error
             lower_bound = future_forecast - 1.96 * std_error
             
             fig.add_trace(go.Scatter(
-                x=future_forecast.index,
-                y=upper_bound,
-                mode='lines',
-                line=dict(width=0),
-                showlegend=False,
-                hoverinfo='skip'
+                x=future_forecast.index, y=upper_bound,
+                mode='lines', line=dict(width=0),
+                showlegend=False, hoverinfo='skip'
             ))
-            
             fig.add_trace(go.Scatter(
-                x=future_forecast.index,
-                y=lower_bound,
-                mode='lines',
-                line=dict(width=0),
+                x=future_forecast.index, y=lower_bound,
+                mode='lines', line=dict(width=0),
                 fillcolor='rgba(255, 127, 14, 0.2)',
                 fill='tonexty',
                 name='95% Confidence Interval',
@@ -712,7 +616,6 @@ else:
             
             st.plotly_chart(fig, use_container_width=True)
             
-            # Forecast summary
             st.markdown("---")
             st.subheader("💰 Ringkasan Forecast")
             col1, col2, col3 = st.columns(3)
@@ -723,13 +626,9 @@ else:
             with col3:
                 st.metric("Rentang", f"£{future_forecast.min():,.0f} - £{future_forecast.max():,.0f}")
     
-    # ========================================================================
-    # TAB 3: MANAJEMEN PRODUK
-    # ========================================================================
     with tab3:
         st.header("📦 Analisis Produk & Forecast")
         
-        # Filter by category
         category_filter = st.multiselect(
             "Filter Kategori",
             options=product_stats['Category'].unique(),
@@ -737,8 +636,6 @@ else:
         )
         
         filtered_products = product_stats[product_stats['Category'].isin(category_filter)]
-        
-        # Product table
         st.subheader("📊 Daftar Produk")
         
         display_df = filtered_products[['ProductName', 'Category', 'TotalQuantity', 
@@ -753,37 +650,29 @@ else:
             height=400
         )
         
-        # Product-level forecast
         st.markdown("---")
         st.subheader("🔮 Forecast Per Produk")
-        
-        # Select top N products
         top_n = st.slider("Jumlah Produk Teratas", 5, 20, 10)
         
         if st.button("Generate Product Forecasts"):
             with st.spinner("Generating forecasts untuk produk..."):
                 product_forecasts = {}
-                
                 for idx, row in product_stats.head(top_n).iterrows():
                     product_no = row['ProductNo']
                     product_name = row['ProductName']
                     
-                    # Get product daily sales
                     product_df = df[df['ProductNo'] == product_no].copy()
                     product_daily = product_df.groupby('Date')['Quantity'].sum()
                     product_daily = product_daily.reindex(
                         pd.date_range(product_daily.index.min(), 
-                                     product_daily.index.max(), 
-                                     freq='D'),
+                                     product_daily.index.max(), freq='D'),
                         fill_value=0
                     )
                     
-                    # Simple forecast (moving average for speed)
                     window = min(7, len(product_daily) // 2)
                     if len(product_daily) > window:
                         forecast_qty = product_daily.rolling(window).mean().iloc[-1]
-                        if pd.isna(forecast_qty):
-                            forecast_qty = product_daily.mean()
+                        forecast_qty = product_daily.mean() if pd.isna(forecast_qty) else forecast_qty
                     else:
                         forecast_qty = product_daily.mean()
                     
@@ -793,7 +682,6 @@ else:
                         '30day_forecast': forecast_qty * 30
                     }
                 
-                # Display forecasts
                 forecast_df = pd.DataFrame([
                     {
                         'Product': v['name'][:40],
@@ -802,10 +690,8 @@ else:
                     }
                     for k, v in product_forecasts.items()
                 ])
-                
                 st.dataframe(forecast_df, use_container_width=True)
                 
-                # Download button
                 csv = forecast_df.to_csv(index=False)
                 st.download_button(
                     label="📥 Download Forecast CSV",
@@ -814,9 +700,6 @@ else:
                     mime="text/csv"
                 )
     
-    # ========================================================================
-    # TAB 4: REKOMENDASI BISNIS
-    # ========================================================================
     with tab4:
         st.header("💡 Rekomendasi Bisnis")
 
@@ -836,7 +719,6 @@ else:
 
         st.markdown("---")
         st.subheader("📌 Rekomendasi Utama")
-        # Generate dynamic recommendations based on actual data
         a_revenue = product_stats[product_stats['Category'] == 'A - Best Sellers (Top 80%)']['TotalRevenue'].sum()
         c_revenue = product_stats[product_stats['Category'] == 'C - Slow Movers']['TotalRevenue'].sum()
         a_pct = (a_revenue / product_stats['TotalRevenue'].sum()) * 100
@@ -870,23 +752,16 @@ else:
             st.write(f"Weekday: {weekday_pct:.1f}% | Weekend: {weekend_pct:.1f}% of revenue")
         st.write("Gunakan pola ini untuk menjadwalkan kampanye dan tenaga kerja.")
     
-    # ========================================================================
-    # TAB 5: ANALISIS DETAIL
-    # ========================================================================
     with tab5:
         st.header("📊 Analisis Detail")
         
-        # Seasonal analysis
         st.subheader("📅 Analisis Musiman")
-        
         df['DayOfWeek'] = df['Date'].dt.day_name()
         df['Month'] = df['Date'].dt.month_name()
         df['IsWeekend'] = df['Date'].dt.dayofweek.isin([5, 6])
         
         col1, col2 = st.columns(2)
-        
         with col1:
-            # Day of week
             dow_data = df.groupby('DayOfWeek')['Revenue'].sum().reindex([
                 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 
                 'Friday', 'Saturday', 'Sunday'
@@ -907,7 +782,6 @@ else:
             st.plotly_chart(fig, use_container_width=True)
         
         with col2:
-            # Weekend vs Weekday
             weekend_data = df.groupby('IsWeekend')['Revenue'].sum()
             weekend_labels = ['Weekday', 'Weekend']
             
@@ -921,11 +795,8 @@ else:
             )
             st.plotly_chart(fig, use_container_width=True)
         
-        # Demand distribution
         st.markdown("---")
         st.subheader("📊 Distribusi Permintaan")
-        
-        # Date range filter
         col1, col2 = st.columns(2)
         with col1:
             start_date = st.date_input(
@@ -942,7 +813,6 @@ else:
                 max_value=ts_data.index.max()
             )
         
-        # Filter data berdasarkan range waktu
         filtered_ts_data = ts_data[(ts_data.index >= pd.Timestamp(start_date)) & 
                                    (ts_data.index <= pd.Timestamp(end_date))]
         
@@ -956,10 +826,8 @@ else:
                 hovertemplate='<b>Revenue Range</b><br>%{x}<br><b>Frequency (Hari)</b>: %{y}<extra></extra>'
             ))
             
-            # Add mean and median lines
             mean_rev = filtered_ts_data['TotalRevenue'].mean()
             median_rev = filtered_ts_data['TotalRevenue'].median()
-            
             fig.add_vline(x=mean_rev, line_dash="dash", line_color="red",
                          annotation_text=f"Mean: £{mean_rev:,.0f}")
             fig.add_vline(x=median_rev, line_dash="dash", line_color="blue",
@@ -973,8 +841,6 @@ else:
                 hovermode='x unified'
             )
             st.plotly_chart(fig, use_container_width=True)
-            
-            # Statistics display di bawah chart
             st.markdown("**Ringkasan Statistik:**")
             col1, col2, col3 = st.columns(3)
             with col1:
@@ -994,10 +860,8 @@ else:
         else:
             st.error("❌ Tidak ada data dalam range tanggal yang dipilih")
         
-        # Correlation analysis
         st.markdown("---")
         st.subheader("🔗 Korelasi Metrics")
-        
         corr_data = ts_data[['TotalRevenue', 'TotalQuantity', 'NumTransactions']].corr()
         
         fig = go.Figure(data=go.Heatmap(
