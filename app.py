@@ -124,6 +124,48 @@ def load_trained_models(file_signature: Optional[tuple]):
         return None, None, None, None, False
 
 
+def train_and_save_models(ts_data):
+    """Train models if they don't exist (for first-time or cloud deployment)"""
+    models_dir = Path(__file__).resolve().parent / 'models'
+    models_dir.mkdir(exist_ok=True)
+    
+    try:
+        train_size = int(len(ts_data) * 0.8)
+        train_data = ts_data['TotalRevenue'][:train_size]
+        
+        # Train ARIMA
+        best_arima = train_arima_model(train_data)
+        if best_arima[0] is not None:
+            joblib.dump(best_arima[0], models_dir / 'arima_model.pkl')
+        
+        # Train Exponential Smoothing
+        best_es = train_exponential_smoothing(train_data)
+        if best_es is not None:
+            joblib.dump(best_es, models_dir / 'es_model.pkl')
+        
+        # Save MA stats
+        ma_value = train_data.rolling(window=7).mean().mean()
+        with open(models_dir / 'ma_stats.pkl', 'wb') as f:
+            pickle.dump({
+                'ma_value': ma_value,
+                'train_data_mean': float(train_data.mean()),
+                'train_data_std': float(train_data.std())
+            }, f)
+        
+        # Save metadata
+        with open(models_dir / 'model_metadata.pkl', 'wb') as f:
+            pickle.dump({
+                'best_order': best_arima[1],
+                'train_size': train_size,
+                'forecast_date': str(pd.Timestamp.now())
+            }, f)
+        
+        return True
+    except Exception as e:
+        st.error(f"❌ Error training models: {str(e)}")
+        return False
+
+
 # Load models on app start
 models_dir = Path(__file__).resolve().parent / 'models'
 file_signature = _models_file_signature(models_dir)
@@ -471,12 +513,28 @@ else:
                 with col3:
                     st.metric("Training Date", str(model_metadata.get('forecast_date'))[:10])
         else:
-            st.warning("⚠️ **No trained models found!** Please run mining.ipynb to train and save models first.")
+            st.warning("⚠️ **No trained models found!** Training models automatically...")
+            
+            # Auto-train models if they don't exist (first run or cloud deployment)
+            if st.button("🔄 Train Models Now", type="secondary"):
+                with st.spinner("🤖 Training models... This may take 1-2 minutes..."):
+                    if train_and_save_models(ts_data):
+                        st.success("✅ Models trained and saved successfully!")
+                        st.info("Please refresh the page to load the newly trained models.")
+                    else:
+                        st.error("❌ Failed to train models. Please run mining.ipynb manually.")
         
         if st.button("🚀 Generate Forecast", type="primary"):
+            # Reload models if they were just trained
+            if not models_loaded:
+                st.info("Attempting to load trained models...")
+                models_dir = Path(__file__).resolve().parent / 'models'
+                file_signature = _models_file_signature(models_dir)
+                arima_model, es_model, ma_stats, model_metadata, models_loaded = load_trained_models(file_signature)
+            
             with st.spinner("Memproses forecasting..."):
                 if not models_loaded:
-                    st.error("❌ Trained models not found! Please run the notebook (mining.ipynb) first to train and save models.")
+                    st.error("❌ Trained models not found! Click 'Train Models Now' button to train them, or run mining.ipynb manually.")
                 else:
                     train_size = int(len(ts_data) * 0.8)
                     train_data = ts_data['TotalRevenue'][:train_size]

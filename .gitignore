@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swapon
+*.swp~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+.jupyter/
+
+# Data files (optional - uncomment if you want to ignore)
+# *.csv
+
+# DO NOT IGNORE models/ - we need to track trained models
+# Models folder should be committed to repo
+
+# Streamlit
+.streamlit/secrets.toml
